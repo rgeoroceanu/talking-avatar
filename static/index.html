@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MuseTalk Live Talking Head</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #1a1a2e; color: #e0e0e0; font-family: system-ui, sans-serif;
+      display: flex; flex-direction: column; align-items: center;
+      padding: 24px 16px; min-height: 100vh;
+    }
+    h1 { margin-bottom: 20px; font-size: 1.4rem; font-weight: 400; }
+
+    /* ── Avatar ── */
+    #avatar-container {
+      position: relative;
+      height: min(640px, 90vh);
+      width: calc(min(640px, 90vh) * var(--frame-ratio, 0.746));
+      max-width: 95vw;
+      border: 2px solid #333; border-radius: 12px; overflow: hidden;
+      background: #111; image-rendering: auto;
+    }
+    #idle-video {
+      width: 100%; height: 100%; object-fit: cover;
+      display: block;
+    }
+    #avatar-display {
+      position: absolute; inset: 0;
+      width: 100%; height: 100%; object-fit: cover;
+      display: none;
+    }
+    #placeholder {
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      color: #555; font-size: 0.85rem; text-align: center; padding: 16px;
+    }
+
+    /* ── Status bar ── */
+    #status {
+      margin-top: 12px; padding: 4px 16px;
+      border-radius: 20px; font-size: 0.8rem; transition: background 0.3s;
+    }
+    .s-idle       { background: #2a2a3e; }
+    .s-connecting { background: #2a3a5e; }
+    .s-processing { background: #4a3a1e; }
+    .s-playing    { background: #1e3a4e; }
+    .s-error      { background: #4a1e1e; }
+    #timing {
+      margin-top: 6px; font-size: 0.72rem; color: #666; font-family: monospace;
+    }
+
+    /* ── Chat area ── */
+    #chat-wrap {
+      margin-top: 18px; width: 380px; max-width: 100%;
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    #chat-log {
+      height: 180px; overflow-y: auto;
+      background: #111; border-radius: 8px; padding: 10px;
+      font-size: 0.78rem; display: flex; flex-direction: column; gap: 8px;
+    }
+    .msg-user {
+      align-self: flex-end; background: #2a4a7f;
+      padding: 6px 10px; border-radius: 10px 10px 2px 10px;
+      max-width: 80%; word-break: break-word;
+    }
+    .msg-avatar {
+      align-self: flex-start; background: #2a3a2a; color: #9db;
+      padding: 6px 10px; border-radius: 10px 10px 10px 2px;
+      max-width: 80%; word-break: break-word; font-style: italic;
+    }
+    #input-row {
+      display: flex; gap: 8px;
+    }
+    #text-input {
+      flex: 1; padding: 10px 12px; font-size: 0.9rem;
+      background: #222; color: #e0e0e0; border: 1px solid #444;
+      border-radius: 8px; resize: none; height: 44px;
+      font-family: system-ui, sans-serif;
+    }
+    #text-input:focus { outline: none; border-color: #3a7bd5; }
+    #send-btn {
+      padding: 10px 20px; font-size: 0.9rem; cursor: pointer;
+      border: none; border-radius: 8px; color: #fff;
+      background: #3a7bd5; transition: opacity 0.2s; white-space: nowrap;
+    }
+    #send-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+
+<h1>MuseTalk Live Talking Head</h1>
+
+<div id="avatar-container">
+  <video id="idle-video" autoplay loop muted playsinline>
+    <source src="/idle.mp4" type="video/mp4">
+  </video>
+  <div id="placeholder" style="display:none">Type a message below to begin</div>
+  <img id="avatar-display" />
+</div>
+
+<div id="status" class="s-idle">Idle</div>
+<div id="timing"></div>
+
+<div id="chat-wrap">
+  <div id="chat-log"></div>
+  <div id="input-row">
+    <textarea id="text-input" placeholder="Type something for the avatar to say…" rows="1"></textarea>
+    <button id="send-btn">Send</button>
+  </div>
+</div>
+
+<script>
+const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
+
+let ws = null;
+let connecting = false;
+let playBuffer = [], nextBuffer = null, frameIdx = 0, timer = null;
+let serverFps = 12;
+let sentAt = 0;
+let pendingAudioUrl = null;
+
+const img        = document.getElementById('avatar-display');
+const idleVideo  = document.getElementById('idle-video');
+const holder     = document.getElementById('placeholder');
+const statusEl   = document.getElementById('status');
+const timingEl   = document.getElementById('timing');
+const sendBtn    = document.getElementById('send-btn');
+const textInput  = document.getElementById('text-input');
+const chatLog    = document.getElementById('chat-log');
+const container  = document.getElementById('avatar-container');
+
+// Hide placeholder — idle video handles the idle state visually
+holder.style.display = 'none';
+
+// Graceful fallback if /idle.mp4 is missing (local dev without GPU)
+idleVideo.addEventListener('error', () => {
+  idleVideo.style.display = 'none';
+  holder.style.display = 'flex';
+}, { once: true });
+
+function setStatus(text, cls) { statusEl.textContent = text; statusEl.className = cls; }
+
+function addMsg(text, role) {
+  const div = document.createElement('div');
+  div.className = role === 'user' ? 'msg-user' : 'msg-avatar';
+  div.textContent = text;
+  chatLog.appendChild(div);
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+// ── WebSocket ──────────────────────────────────────────────
+
+function ensureConnected() {
+  return new Promise((resolve, reject) => {
+    if (ws && ws.readyState === WebSocket.OPEN) { resolve(); return; }
+    if (connecting) { reject(new Error('already connecting')); return; }
+
+    connecting = true;
+    setStatus('Connecting…', 's-connecting');
+    ws = new WebSocket(WS_URL);
+
+    ws.onopen = () => {
+      connecting = false;
+      setStatus('Connected', 's-idle');
+      resolve();
+    };
+    ws.onmessage = (e) => onMessage(JSON.parse(e.data));
+    ws.onerror = () => {
+      connecting = false;
+      setStatus('Connection error', 's-error');
+      reject(new Error('WS error'));
+    };
+    ws.onclose = () => {
+      connecting = false;
+      ws = null;
+      setStatus('Idle', 's-idle');
+    };
+  });
+}
+
+function onMessage(msg) {
+  switch (msg.type) {
+    case 'status':
+      if (msg.message === 'processing') setStatus('Processing…', 's-processing');
+      break;
+    case 'audio': {
+      const bytes = Uint8Array.from(atob(msg.data), c => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: 'audio/mpeg' });
+      pendingAudioUrl = URL.createObjectURL(blob);
+      break;
+    }
+    case 'chunk_start':
+      nextBuffer = [];
+      serverFps = msg.fps || 12;
+      // Sync container ratio from actual frame dimensions (redundant if initDims succeeded)
+      if (msg.width && msg.height) setFrameDims(msg.width, msg.height);
+      break;
+    case 'frame':
+      if (nextBuffer) nextBuffer.push(msg.data);
+      break;
+    case 'chunk_end': {
+      const latency = ((Date.now() - sentAt) / 1000).toFixed(1);
+      const n = nextBuffer ? nextBuffer.length : 0;
+      timingEl.textContent = `${n} frames | ${latency}s latency | ${serverFps}fps`;
+      swapBuffers();
+      setStatus('Playing…', 's-playing');
+      sendBtn.disabled = false;
+      textInput.disabled = false;
+      break;
+    }
+    case 'error':
+      setStatus('Error: ' + msg.message, 's-error');
+      sendBtn.disabled = false;
+      textInput.disabled = false;
+      break;
+  }
+}
+
+// ── Playback ───────────────────────────────────────────────
+
+function swapBuffers() {
+  if (!timer && nextBuffer && nextBuffer.length) {
+    playBuffer = nextBuffer;
+    nextBuffer = null;
+    startPlayback();
+  }
+}
+
+function startPlayback() {
+  // Hide idle video, show inference frames
+  idleVideo.style.display = 'none';
+  img.style.display = 'block';
+
+  // Start audio in sync with first frame
+  if (pendingAudioUrl) {
+    const audio = new Audio(pendingAudioUrl);
+    audio.play().catch(() => {});
+    audio.onended = () => URL.revokeObjectURL(pendingAudioUrl);
+    pendingAudioUrl = null;
+  }
+
+  frameIdx = 0;
+  const interval = Math.round(1000 / serverFps);
+  timer = setInterval(tick, interval);
+}
+
+function tick() {
+  if (frameIdx < playBuffer.length) {
+    img.src = 'data:image/jpeg;base64,' + playBuffer[frameIdx++];
+  } else {
+    clearInterval(timer); timer = null;
+    if (nextBuffer && nextBuffer.length) {
+      playBuffer = nextBuffer; nextBuffer = null;
+      startPlayback();
+    } else {
+      // Playback done — return to idle video
+      img.style.display = 'none';
+      idleVideo.style.display = 'block';
+      idleVideo.play().catch(() => {});
+      setStatus('Idle', 's-idle');
+    }
+  }
+}
+
+// ── Send ───────────────────────────────────────────────────
+
+async function send() {
+  const text = textInput.value.trim();
+  if (!text) return;
+
+  textInput.value = '';
+  sendBtn.disabled = true;
+  textInput.disabled = true;
+  addMsg(text, 'user');
+
+  try {
+    await ensureConnected();
+  } catch {
+    setStatus('Could not connect', 's-error');
+    sendBtn.disabled = false;
+    textInput.disabled = false;
+    return;
+  }
+
+  sentAt = Date.now();
+  ws.send(JSON.stringify({ text }));
+  setStatus('Processing…', 's-processing');
+}
+
+// ── Dims ────────────────────────────────────────────────────
+
+function setFrameDims(w, h) {
+  document.documentElement.style.setProperty('--frame-ratio', w / h);
+}
+
+async function initDims() {
+  try {
+    const r = await fetch('/dims');
+    if (r.ok) {
+      const d = await r.json();
+      setFrameDims(d.width, d.height);
+    }
+  } catch {}
+}
+
+// Fetch dims on load so container is correct before first inference.
+// Falls back to CSS default (0.746) if engine is still warming up or on test_server.
+initDims();
+
+sendBtn.onclick = send;
+
+textInput.addEventListener('keydown', (e) => {
+  // Enter without Shift submits; Shift+Enter inserts newline
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
+</script>
+</body>
+</html>

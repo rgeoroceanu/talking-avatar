@@ -1,0 +1,22 @@
+services:
+  musetalk:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    container_name: musetalk-live
+    ports:
+      - "8080:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - PYTHONUNBUFFERED=1
+    shm_size: "2g"
+    restart: unless-stopped
