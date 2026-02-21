@@ -14,8 +14,8 @@ echo ""
 
 # Build and push container image
 gcloud builds submit "$ROOT_DIR" \
-    --tag gcr.io/$PROJECT_ID/musetalk-live \
-    --dockerfile deployment/Dockerfile
+    --config "$SCRIPT_DIR/cloudbuild.yaml" \
+    --substitutions "_IMAGE=gcr.io/$PROJECT_ID/musetalk-live"
 
 # Deploy to Cloud Run with L4 GPU
 gcloud run deploy musetalk-live \
