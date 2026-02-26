@@ -3,6 +3,14 @@ engine/avatar.py — Idle video I/O, frame scaling, face detection, VAE encoding
 
 All musetalk imports are lazy (inside preprocess_avatar) so this module can be
 imported in test environments without MuseTalk installed.
+
+Environment variables:
+  IDLE_VIDEO_PATH  — default idle video path used when no avatar_id is given
+                     (default: /app/idle.mp4)
+  DATA_PATH        — root directory for per-avatar data
+                     (default: ./data)
+                     Per-avatar idle video is expected at:
+                       {DATA_PATH}/avatars/{avatar_id}/idle.mp4
 """
 
 from __future__ import annotations
@@ -11,6 +19,35 @@ import dataclasses
 import gc
 import os
 from typing import TYPE_CHECKING
+
+# ---------------------------------------------------------------------------
+# Environment-driven defaults
+# ---------------------------------------------------------------------------
+
+_DEFAULT_IDLE_VIDEO_PATH: str = os.environ.get("IDLE_VIDEO_PATH", "/app/idle.mp4")
+_DATA_PATH: str = os.environ.get("DATA_PATH", "./data")
+
+
+def resolve_idle_video_path(avatar_id: str | None = None) -> str:
+    """Return the idle video path for a given avatar_id.
+
+    If avatar_id is provided, the path is:
+        {DATA_PATH}/avatars/{avatar_id}/idle.mp4
+
+    Falls back to the IDLE_VIDEO_PATH env var (default: /app/idle.mp4) when:
+      - avatar_id is None or empty, or
+      - the per-avatar file does not exist.
+    """
+    if avatar_id:
+        candidate = os.path.join(_DATA_PATH, "avatars", avatar_id, "idle.mp4")
+        if os.path.exists(candidate):
+            return candidate
+        print(
+            f"[avatar] idle video not found for avatar_id={avatar_id!r} at {candidate!r}; "
+            f"falling back to default {_DEFAULT_IDLE_VIDEO_PATH!r}"
+        )
+    return _DEFAULT_IDLE_VIDEO_PATH
+
 
 import cv2
 import numpy as np

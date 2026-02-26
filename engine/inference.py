@@ -166,26 +166,69 @@ def warmup(models: ModelBundle) -> None:
 
 
 class MuseTalkEngine:
-    """Thin coordinator: owns asyncio.Lock + thread-executor wrapper."""
+    """Thin coordinator: owns asyncio.Lock + thread-executor wrapper.
 
-    def __init__(self, model_dir: str, idle_path: str, config: EngineConfig) -> None:
+    Parameters
+    ----------
+    model_dir:
+        Directory containing MuseTalk model weights (shared across all avatar
+        instances — loaded once).
+    idle_path:
+        Path to the idle video file used to preprocess avatar frames.  Pass
+        ``None`` to defer idle-path resolution to ``avatar_id`` at
+        ``initialize()`` time.
+    config:
+        EngineConfig instance controlling inference parameters.
+    avatar_id:
+        Optional identifier used to resolve the idle video path dynamically via
+        ``engine.avatar.resolve_idle_video_path``.  When provided and
+        ``idle_path`` is ``None``, the path is resolved from the DATA_PATH
+        environment variable.
+    models:
+        Pre-loaded ``ModelBundle``.  When supplied the engine skips model
+        loading and CUDA warmup (they are shared) and only runs avatar
+        preprocessing.  This is used by the LRU cache in the server to avoid
+        reloading weights for every avatar.
+    """
+
+    def __init__(
+        self,
+        model_dir: str,
+        idle_path: str | None,
+        config: EngineConfig,
+        *,
+        avatar_id: str | None = None,
+        models=None,
+    ) -> None:
         self._model_dir = model_dir
         self._idle_path = idle_path
         self._config = config
-        self._models = None
+        self._avatar_id = avatar_id
+        self._models = models  # may be pre-supplied (shared)
         self._avatar = None
         self._lock = asyncio.Lock()
+        self._owns_models: bool = models is None  # True → we loaded them, must warmup
 
     def initialize(self) -> None:
         """Blocking. Call once from startup event via run_in_executor."""
         from .models import load_models  # noqa: PLC0415
-        from .avatar import preprocess_avatar  # noqa: PLC0415
+        from .avatar import preprocess_avatar, resolve_idle_video_path  # noqa: PLC0415
+
+        # Resolve idle path: explicit > avatar_id lookup > env default
+        idle_path = self._idle_path
+        if idle_path is None:
+            idle_path = resolve_idle_video_path(self._avatar_id)
 
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        print(f"Initializing MuseTalk engine on {device}")
-        self._models = load_models(self._model_dir, device)
-        self._avatar = preprocess_avatar(self._idle_path, self._models, self._config.max_output_dim)
-        warmup(self._models)
+
+        if self._owns_models:
+            print(f"Initializing MuseTalk engine on {device}")
+            self._models = load_models(self._model_dir, device)
+            warmup(self._models)
+        else:
+            print(f"Reusing pre-loaded models for avatar_id={self._avatar_id!r} on {device}")
+
+        self._avatar = preprocess_avatar(idle_path, self._models, self._config.max_output_dim)
         print("Engine ready")
 
     @property
